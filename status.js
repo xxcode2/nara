@@ -1,105 +1,30 @@
 // ============================================================
-// CONSOLIDATE - Transfer semua NARA ke main wallet
+// NARA MULTI-WALLET MINER
+// Automated PoMI mining across 300 wallets
 // ============================================================
 
 import {
+  getQuestInfo,
+  hasAnswered,
+  generateProof,
+  submitAnswer,
+  submitAnswerViaRelay,
+  parseQuestReward,
   Keypair,
 } from 'nara-sdk';
-import {
-  Connection,
-  PublicKey,
-  SystemProgram,
-  Transaction,
-  sendAndConfirmTransaction,
-  LAMPORTS_PER_SOL,
-} from '@solana/web3.js';
+import { Connection } from '@solana/web3.js';
 import fs from 'fs';
 import path from 'path';
+import pLimit from 'p-limit';
 import chalk from 'chalk';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
+import { solveQuestion } from './solver.js';
+import { consolidateAll } from './consolidate.js';
 
-const NARA_DECIMALS = 9; // Solana-compatible, 1 NARA = 10^9 lamports
+// ──── LOAD WALLETS ────
 
-/**
- * Consolidate NARA dari semua sub-wallets ke main wallet
- */
-export async function consolidateAll(connection, wallets, mainWalletAddress, threshold) {
-  const mainPubkey = new PublicKey(mainWalletAddress);
-  let totalTransferred = 0;
-  let successCount = 0;
-  let failCount = 0;
-
-  log.info(`Consolidating to: ${mainWalletAddress}`);
-  log.info(`Threshold: ${threshold} NARA`);
-
-  for (const wallet of wallets) {
-    try {
-      // Cek balance
-      const balance = await connection.getBalance(wallet.keypair.publicKey);
-      const balanceNara = balance / LAMPORTS_PER_SOL;
-
-      if (balanceNara < threshold) {
-        log.debug(`[W-${wallet.index}] Balance ${balanceNara} < threshold, skip`);
-        continue;
-      }
-
-      // Hitung amount (sisain sedikit buat fee)
-      const fee = 0.001; // reserve 0.001 NARA buat tx fee
-      const transferAmount = balanceNara - fee;
-
-      if (transferAmount <= 0) {
-        continue;
-      }
-
-      const lamports = Math.floor(transferAmount * LAMPORTS_PER_SOL);
-
-      // Buat & kirim transaction
-      const tx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.keypair.publicKey,
-          toPubkey: mainPubkey,
-          lamports,
-        })
-      );
-
-      const signature = await sendAndConfirmTransaction(connection, tx, [wallet.keypair], {
-        commitment: 'confirmed',
-      });
-
-      totalTransferred += transferAmount;
-      successCount++;
-      log.success(`[W-${wallet.index}] Sent ${transferAmount.toFixed(4)} NARA → ${mainWalletAddress.slice(0, 8)}... (tx: ${signature.slice(0, 16)}...)`);
-    } catch (e) {
-      failCount++;
-      log.warn(`[W-${wallet.index}] Transfer gagal: ${e.message}`);
-    }
-  }
-
-  console.log('');
-  log.info(chalk.bold('── Consolidation Summary ──'));
-  log.success(`  Transferred: ${totalTransferred.toFixed(4)} NARA`);
-  log.info(`  Success: ${successCount} wallets`);
-  if (failCount > 0) log.warn(`  Failed: ${failCount} wallets`);
-  log.info(`  Destination: ${mainWalletAddress}`);
-  console.log('');
-
-  return { totalTransferred, successCount, failCount };
-}
-
-// ──── STANDALONE MODE ────
-
-async function main() {
-  console.log(chalk.cyan.bold('\n╔══════════════════════════════════════╗'));
-  console.log(chalk.cyan.bold('║   NARA CONSOLIDATOR v1.0            ║'));
-  console.log(chalk.cyan.bold('╚══════════════════════════════════════╝\n'));
-
-  if (CONFIG.MAIN_WALLET === 'GANTI_DENGAN_WALLET_UTAMA_MU') {
-    log.error('Main wallet belum di-set! Edit src/config.js dulu.');
-    process.exit(1);
-  }
-
-  // Load wallets
+function loadWallets() {
   if (!fs.existsSync(CONFIG.WALLETS_INDEX)) {
     log.error('Wallet index tidak ditemukan. Jalankan: npm run generate');
     process.exit(1);
@@ -119,51 +44,254 @@ async function main() {
     });
   }
 
+  return wallets;
+}
+
+// ──── MINE SINGLE WALLET ────
+
+async function mineWithWallet(connection, wallet, quest, answer) {
+  const idx = wallet.index;
+
+  try {
+    // Cek apakah udah jawab round ini
+    const alreadyAnswered = await hasAnswered(connection, wallet.keypair);
+    if (alreadyAnswered) {
+      log.debug(`[W-${idx}] Udah jawab round ini, skip`);
+      return { wallet: idx, status: 'skipped', reason: 'already_answered' };
+    }
+
+    // Generate ZK proof
+    log.mining(idx, 'Generating ZK proof...');
+    let proof;
+    try {
+      proof = await generateProof(
+        answer,
+        quest.answerHash,
+        wallet.keypair.publicKey,
+        quest.round
+      );
+    } catch (e) {
+      log.warn(`[W-${idx}] Proof generation gagal: ${e.message}`);
+      return { wallet: idx, status: 'failed', reason: 'proof_failed', error: e.message };
+    }
+
+    // Submit answer
+    log.mining(idx, 'Submitting answer...');
+    let signature;
+
+    if (CONFIG.USE_RELAY) {
+      // Gasless via relay
+      try {
+        const result = await submitAnswerViaRelay(
+          CONFIG.RELAY_URL,
+          wallet.keypair.publicKey,
+          proof.hex
+        );
+        signature = result.txHash;
+        log.mining(idx, chalk.green(`Relay submit OK: ${signature.slice(0, 16)}...`));
+      } catch (e) {
+        log.warn(`[W-${idx}] Relay submit gagal: ${e.message}`);
+        return { wallet: idx, status: 'failed', reason: 'relay_failed', error: e.message };
+      }
+    } else {
+      // Direct on-chain submit
+      try {
+        const result = await submitAnswer(
+          connection,
+          wallet.keypair,
+          proof.solana
+        );
+        signature = result.signature;
+        log.mining(idx, chalk.green(`Direct submit OK: ${signature.slice(0, 16)}...`));
+      } catch (e) {
+        log.warn(`[W-${idx}] Direct submit gagal: ${e.message}`);
+        return { wallet: idx, status: 'failed', reason: 'submit_failed', error: e.message };
+      }
+    }
+
+    // Cek reward
+    try {
+      // Tunggu sebentar biar tx confirmed
+      await sleep(2000);
+      const reward = await parseQuestReward(connection, signature);
+      if (reward.rewarded) {
+        log.success(`[W-${idx}] REWARD! ${reward.rewardNso} NARA`);
+        return { wallet: idx, status: 'rewarded', reward: reward.rewardNso, tx: signature };
+      } else {
+        log.mining(idx, chalk.yellow('Submitted tapi ga dapet reward (slot penuh)'));
+        return { wallet: idx, status: 'submitted', reward: 0, tx: signature };
+      }
+    } catch (e) {
+      log.mining(idx, chalk.yellow(`Submitted, reward check gagal: ${e.message}`));
+      return { wallet: idx, status: 'submitted', reward: null, tx: signature };
+    }
+  } catch (e) {
+    log.error(`[W-${idx}] Unexpected error: ${e.message}`);
+    return { wallet: idx, status: 'error', error: e.message };
+  }
+}
+
+// ──── MAIN MINING LOOP ────
+
+async function startMining() {
+  console.log(chalk.cyan.bold('\n╔══════════════════════════════════════╗'));
+  console.log(chalk.cyan.bold('║   NARA MULTI-WALLET MINER v1.0      ║'));
+  console.log(chalk.cyan.bold('╚══════════════════════════════════════╝\n'));
+
+  // Load wallets
+  const wallets = loadWallets();
   log.info(`Loaded ${wallets.length} wallets`);
+  log.info(`RPC: ${CONFIG.RPC_URL}`);
+  log.info(`Relay: ${CONFIG.USE_RELAY ? CONFIG.RELAY_URL : 'DISABLED'}`);
+  log.info(`Main Wallet: ${CONFIG.MAIN_WALLET}`);
+  log.info(`Concurrency: ${CONFIG.CONCURRENCY}`);
+  console.log('');
 
   const connection = new Connection(CONFIG.RPC_URL, 'confirmed');
+  const limit = pLimit(CONFIG.CONCURRENCY);
 
-  // Cek total balance dulu
-  log.info('Scanning balances...');
-  let totalBalance = 0;
-  let nonZero = 0;
+  let roundCount = 0;
+  let totalRewards = 0;
+  let lastRound = null;
 
-  for (const wallet of wallets) {
+  // Stats tracking
+  const stats = {
+    rounds: 0,
+    totalSubmitted: 0,
+    totalRewarded: 0,
+    totalNara: 0,
+    errors: 0,
+    startTime: Date.now(),
+  };
+
+  // ──── MINING LOOP ────
+
+  while (true) {
     try {
-      const balance = await connection.getBalance(wallet.keypair.publicKey);
-      const balanceNara = balance / LAMPORTS_PER_SOL;
-      if (balanceNara > 0) {
-        totalBalance += balanceNara;
-        nonZero++;
-        log.debug(`[W-${wallet.index}] ${wallet.address.slice(0, 12)}... = ${balanceNara.toFixed(4)} NARA`);
+      // Fetch current quest
+      log.info('Fetching quest...');
+      const quest = await getQuestInfo(connection);
+
+      if (!quest.active || quest.expired) {
+        log.info('No active quest / expired. Waiting...');
+        await sleep(CONFIG.POLL_INTERVAL_MS);
+        continue;
       }
-    } catch { /* skip */ }
+
+      // Skip kalau masih round yang sama
+      if (quest.round === lastRound) {
+        log.debug(`Same round (${quest.round}), waiting...`);
+        await sleep(CONFIG.POLL_INTERVAL_MS);
+        continue;
+      }
+
+      // New round!
+      lastRound = quest.round;
+      roundCount++;
+      stats.rounds++;
+
+      log.info(chalk.bold(`\n═══ ROUND ${roundCount} ═══`));
+      log.info(`Question: ${quest.question}`);
+      log.info(`Reward: ${quest.rewardPerWinner} NARA x ${quest.rewardCount} slots`);
+      log.info(`Remaining slots: ${quest.remainingSlots}`);
+      log.info(`Deadline: ${quest.timeRemaining}s`);
+
+      if (quest.remainingSlots <= 0) {
+        log.warn('No remaining slots, skip round');
+        await sleep(CONFIG.POLL_INTERVAL_MS);
+        continue;
+      }
+
+      // Solve question
+      const answer = solveQuestion(quest.question);
+      if (!answer) {
+        log.error(`Gabisa solve: "${quest.question}"`);
+        await sleep(CONFIG.POLL_INTERVAL_MS);
+        continue;
+      }
+
+      log.info(chalk.green(`Answer: ${answer}`));
+
+      // Mine semua wallet secara concurrent (dengan limit)
+      const results = await Promise.allSettled(
+        wallets.map(wallet =>
+          limit(() => mineWithWallet(connection, wallet, quest, answer))
+        )
+      );
+
+      // Hitung stats
+      let roundRewarded = 0;
+      let roundNara = 0;
+      let roundErrors = 0;
+      let roundSubmitted = 0;
+
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          const r = result.value;
+          if (r.status === 'rewarded') {
+            roundRewarded++;
+            roundNara += r.reward || 0;
+          }
+          if (r.status === 'submitted' || r.status === 'rewarded') {
+            roundSubmitted++;
+          }
+          if (r.status === 'failed' || r.status === 'error') {
+            roundErrors++;
+          }
+        } else {
+          roundErrors++;
+        }
+      }
+
+      stats.totalSubmitted += roundSubmitted;
+      stats.totalRewarded += roundRewarded;
+      stats.totalNara += roundNara;
+      stats.errors += roundErrors;
+
+      // Round summary
+      console.log('');
+      log.info(chalk.bold('── Round Summary ──'));
+      log.info(`  Submitted : ${roundSubmitted}`);
+      log.success(`  Rewarded  : ${roundRewarded}`);
+      log.info(`  NARA Earned: ${roundNara}`);
+      if (roundErrors > 0) log.warn(`  Errors    : ${roundErrors}`);
+      log.info(chalk.bold('── Total Stats ──'));
+      log.info(`  Rounds    : ${stats.rounds}`);
+      log.info(`  Submitted : ${stats.totalSubmitted}`);
+      log.success(`  Rewarded  : ${stats.totalRewarded}`);
+      log.info(`  Total NARA: ${stats.totalNara}`);
+      const uptime = ((Date.now() - stats.startTime) / 60000).toFixed(1);
+      log.info(`  Uptime    : ${uptime} min`);
+      console.log('');
+
+      // Auto consolidate
+      if (CONFIG.AUTO_CONSOLIDATE && roundCount % CONFIG.CONSOLIDATE_AFTER_ROUNDS === 0) {
+        log.info(chalk.yellow('Auto consolidating rewards to main wallet...'));
+        try {
+          await consolidateAll(connection, wallets, CONFIG.MAIN_WALLET, CONFIG.CONSOLIDATE_THRESHOLD);
+        } catch (e) {
+          log.error(`Consolidate error: ${e.message}`);
+        }
+      }
+
+      // Wait sebelum cek round berikutnya
+      await sleep(CONFIG.ROUND_WAIT_MS);
+    } catch (e) {
+      log.error(`Mining loop error: ${e.message}`);
+      await sleep(CONFIG.POLL_INTERVAL_MS);
+    }
   }
-
-  console.log('');
-  log.info(`Total balance across all wallets: ${chalk.bold(totalBalance.toFixed(4))} NARA`);
-  log.info(`Wallets with balance: ${chalk.bold(nonZero)} / ${wallets.length}`);
-  console.log('');
-
-  if (nonZero === 0) {
-    log.warn('Semua wallet kosong, nothing to consolidate.');
-    return;
-  }
-
-  // Execute consolidation
-  await consolidateAll(
-    connection,
-    wallets,
-    CONFIG.MAIN_WALLET,
-    CONFIG.CONSOLIDATE_THRESHOLD
-  );
 }
 
-// Cek apakah dijalankan standalone
-const isMain = process.argv[1]?.endsWith('consolidate.js');
-if (isMain) {
-  main().catch(err => {
-    log.error(`Fatal: ${err.message}`);
-    process.exit(1);
-  });
+// ──── UTILS ────
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+// ──── RUN ────
+
+startMining().catch(err => {
+  log.error(`Fatal: ${err.message}`);
+  process.exit(1);
+});
